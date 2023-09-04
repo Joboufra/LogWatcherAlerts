@@ -1,5 +1,6 @@
 ﻿using System.Text;
 using Microsoft.Extensions.Configuration;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
 class LogWatcherAlerts
@@ -31,12 +32,11 @@ class LogWatcherAlerts
 
         string path = _configuration.GetSection("AppSettings")["LogFilePath"];
         FileSystemWatcher watcher = new FileSystemWatcher(Path.GetDirectoryName(path), Path.GetFileName(path));
+        Console.WriteLine($"Observando el archivo: {path}");
 
         watcher.Changed += OnChanged;
         watcher.EnableRaisingEvents = true;
-        Console.WriteLine(":: LogWatcherAlerts -> Jira Tickets ::");
-        Console.WriteLine(":: Jose Boullosa @ 2023 ::");
-        Console.WriteLine("");
+
         LogMessage("Programa iniciado. Presiona enter para salir");
         Console.ReadLine();
 
@@ -58,14 +58,25 @@ class LogWatcherAlerts
                     string line;
                     while ((line = reader.ReadLine()) != null)
                     {
-                        if (line.Contains("[ALERTA]")) alertMessages.Add(line.Replace("[ALERTA]", ""));
+                        if (line.Contains("Server log: [ALERTA]"))
+                        {
+                            try
+                            {
+                                JObject logEntry = JObject.Parse(line);
+                                string message = logEntry["message"]?.ToString() ?? "";
+                                alertMessages.Add(message.Replace("[ALERTA]", ""));
+                            }
+                            catch (JsonReaderException ex)
+                            {
+                                LogMessage($"Error al parsear JSON: {ex.Message}");
+                            }
+                        }
                     }
                     lastPosition = stream.Position;
                 }
             }
         }
         SaveLastPosition();
-
         foreach (var alert in alertMessages)
         {
             await ProcessAlert(alert);
@@ -74,19 +85,24 @@ class LogWatcherAlerts
 
     private static async Task ProcessAlert(string alert)
     {
-        string apiKey = _configuration.GetSection("AppSettings")["ApiKey"];
         string[] messages = alert.Split(';');
+        string summary = $"{messages[1]} en {messages[2]}"; //Añadimos el host.name
+        string description = messages[7];
 
         // JSON para Jira
         JObject jiraData = new JObject(
             new JProperty("fields", new JObject(
                 new JProperty("project", new JObject(new JProperty("key", "AL"))),
-                new JProperty("summary", messages[0]),
-                new JProperty("description", messages[1]),
-                new JProperty("issuetype", new JObject(new JProperty("name", "Alerta"))))));
+                new JProperty("summary", summary),
+                new JProperty("description", description),
+                new JProperty("issuetype", new JObject(new JProperty("name", "Alerta")))
+            ))
+        );
 
+        //Enviamos petición
         using (HttpClient client = new HttpClient())
         {
+            string apiKey = _configuration.GetSection("AppSettings")["ApiKey"];
             client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", Convert.ToBase64String(System.Text.ASCIIEncoding.ASCII.GetBytes($"joboufra@proton.me:{apiKey}")));
 
             var response = await client.PostAsync("https://joboufra.atlassian.net/rest/api/2/issue",
@@ -97,14 +113,13 @@ class LogWatcherAlerts
                 var responseBody = await response.Content.ReadAsStringAsync();
                 JObject jsonResponse = JObject.Parse(responseBody);
                 string ticketKey = jsonResponse["key"].ToString();
-                string ticketUrl = jsonResponse["self"].ToString();
+                string ticketUrl = $"https://joboufra.atlassian.net/browse/{ticketKey}";
                 LogMessage($"Ticket creado: {ticketKey}. Enlace: {ticketUrl}");
             }
             else
             {
                 LogMessage("Error al crear ticket");
             }
-
         }
     }
 }
